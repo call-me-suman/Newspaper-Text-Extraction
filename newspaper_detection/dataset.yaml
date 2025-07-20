@@ -1,0 +1,10 @@
+names:
+  0: article
+  1: banner
+  2: headline
+  3: image
+  4: subheadline
+path: C:\Users\ajaye\OneDrive\Desktop\OCR python\dataset\newspaper.v2.yolov8
+test: test/images
+train: train/images
+val: valid/images

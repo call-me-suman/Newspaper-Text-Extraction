@@ -1,0 +1,26 @@
+# Ignore model weights
+*.pt
+
+# Ignore dataset files
+dataset/
+!dataset/data.yaml  # Keep config if needed
+
+# Ignore results
+*.csv
+*.jpg
+*.png
+
+# Ignore Python cache
+__pycache__/
+*.py[cod]
+
+# Ignore virtual environments
+.venv/
+env/
+venv/
+
+# Ignore Jupyter Notebook checkpoints (if used)
+.ipynb_checkpoints/
+
+# VSCode settings
+.vscode/
