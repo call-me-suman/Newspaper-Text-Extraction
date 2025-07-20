@@ -1,3 +1,4 @@
+import glob
 import os
 import argparse
 import cv2
@@ -12,6 +13,7 @@ from matplotlib.patches import Rectangle
 from dotenv import load_dotenv
 from transformers import pipeline
 from scipy.signal import find_peaks
+
 
 # Load environment variables from .env file for API keys
 load_dotenv()
@@ -263,7 +265,44 @@ def process_article_in_columns(img, headline_box, num_columns=None):
             # Enhance with LLM
             column['text'] = enhance_text_with_llm(column['text'])
     
-    return columns
+    consolidated_text = consolidate_column_text([col['text'] for col in columns if col['text']])
+    
+    return consolidated_text
+def consolidate_column_text(column_texts):
+    """
+    Consolidate text from multiple columns and remove duplicates
+    
+    Args:
+        column_texts: List of text strings from different columns
+        
+    Returns:
+        Consolidated text with duplicates removed
+    """
+    if not column_texts:
+        return ""
+    
+    # Break texts into sentences
+    all_sentences = []
+    for text in column_texts:
+        # Split by sentence endings (., !, ?)
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        all_sentences.extend([s.strip() for s in sentences if s.strip()])
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    consolidated_sentences = []
+    for sentence in all_sentences:
+        # Normalize the sentence for comparison (lowercase, remove excess spaces)
+        normalized = re.sub(r'\s+', ' ', sentence.lower().strip())
+        if normalized not in seen and len(normalized) > 5:  # Ignore very short fragments
+            seen.add(normalized)
+            consolidated_sentences.append(sentence)
+    
+    # Join sentences back into text
+    consolidated_text = " ".join(consolidated_sentences)
+    
+    return consolidated_text
+
 
 # Initialize the text correction pipeline globally to avoid reloading it multiple times
 text_corrector = None
@@ -320,6 +359,9 @@ def enhance_text_with_llm(text):
         
         # Extract the generated text
         enhanced_text = result[0]['generated_text'].strip()
+        prompt_prefix = "Fix OCR errors in this text:"
+        if enhanced_text.startswith(prompt_prefix):
+            enhanced_text = enhanced_text[len(prompt_prefix):].strip()
         
         # If the model returns something empty or much shorter, use the original
         if not enhanced_text or len(enhanced_text) < len(text) / 2:
@@ -598,73 +640,27 @@ def process_single_image(model, image_path, conf_threshold=0.05, ocr_languages=[
     text_blocks.sort(key=lambda x: (x['box'][1], x['box'][0]))
     
     # Structure the text into articles
-    articles = []
+    articles_json = {}
     
     # For each headline, find associated subheadlines and process content in columns
     for idx, headline in enumerate(headlines):
-        article = {
-            'article_number': idx + 1,
-            'headline': headline['text'],
-            'subheadlines': [],
-            'columns': [],
-            'content': "",
-            'position': headline['box']
-        }
-        
-        headline_box = headline['box']
-        
-        # Find subheadlines associated with this headline
-        associated_subheadlines = []
-        for subheadline in subheadlines:
-            if is_close_to(subheadline['box'], headline_box):
-                associated_subheadlines.append(subheadline['text'])
-                subheadline['assigned'] = True
-        
-        article['subheadlines'] = associated_subheadlines
+        # Use index as key
+        article_key = str(idx)
         
         # Process article content using column-based extraction
-        columns = process_article_in_columns(img, headline_box, num_columns)
+        content = process_article_in_columns(img, headline['box'], num_columns)
         
-        # Store column information
-        article['columns'] = []
-        for i, column in enumerate(columns):
-            article['columns'].append({
-                'column_number': i + 1,
-                'text': column['text']
-            })
+        # If no content was found, try the fallback method
+        if not content:
+            fallback_result = generate_fallback_content(img, headline['box'], num_columns)
+            # Get consolidated text from fallback
+            content = consolidate_column_text([col['text'] for col in fallback_result['columns'] if col['text']])
         
-        # For backwards compatibility, also include all text as a single content field
-        article['content'] = " ".join([col['text'] for col in article['columns'] if col['text'].strip()])
-        
-        # If no content was found via columns, try the fallback method
-        if not article['content']:
-            fallback_result = generate_fallback_content(img, headline_box, num_columns)
-            
-            # Update columns and content
-            if fallback_result['columns']:
-                article['columns'] = []
-                for i, column in enumerate(fallback_result['columns']):
-                    article['columns'].append({
-                        'column_number': i + 1,
-                        'text': column['text']
-                    })
-            
-            article['content'] = fallback_result['combined_text']
-        
-        articles.append(article)
-        
-        # Save column visualization if requested
-        if save_visualization and columns:
-            output_dir = os.path.dirname(image_path) if os.path.dirname(image_path) else '.'
-            base_filename = os.path.splitext(os.path.basename(image_path))[0]
-            col_vis_path = os.path.join(output_dir, f"{base_filename}_article{idx+1}_columns.jpg")
-            
-            # Create a cropped image for this article
-            x1, y1, x2, y2 = [int(coord) for coord in headline_box]
-            article_img = img[y1:, 0:img.shape[1]]  # From headline to bottom
-            
-            # Fix: Pass the article_img as the first parameter
-            visualize_columns(article_img, columns, col_vis_path)
+        # Create article entry in simplified format
+        articles_json[article_key] = {
+            "headlines": headline['text'],
+            "content": content
+        }
     
     # Handle orphan text blocks (not associated with any headline)
     orphan_text_blocks = [tb for tb in text_blocks if not tb.get('assigned', False)]
@@ -697,44 +693,19 @@ def process_single_image(model, image_path, conf_threshold=0.05, ocr_languages=[
                     column['text'] = clean_ocr_text(column['text'])
                     column['text'] = enhance_text_with_llm(column['text'])
             
-            # Create an article for orphan content
-            orphan_content = " ".join([col['text'] for col in orphan_columns if col['text'].strip()])
+            # Consolidate orphan content
+            orphan_content = consolidate_column_text([col['text'] for col in orphan_columns if col['text']])
+            
             if orphan_content:
-                article = {
-                    'article_number': len(articles) + 1,
-                    'headline': 'Untitled Article',
-                    'subheadlines': [],
-                    'columns': [],
-                    'content': orphan_content,
-                    'position': [x_min, y_min, x_max, y_max]
+                # Add orphan content as a separate article
+                article_key = str(len(articles_json))
+                articles_json[article_key] = {
+                    "headlines": "Untitled Article",
+                    "content": orphan_content
                 }
-                
-                # Add column information
-                for i, column in enumerate(orphan_columns):
-                    if column['text'].strip():
-                        article['columns'].append({
-                            'column_number': i + 1,
-                            'text': column['text']
-                        })
-                
-                articles.append(article)
     
-    # Sort articles by position (top to bottom)
-    articles.sort(key=lambda x: x['position'][1])
-    
-    # Remove position data from final output
-    for article in articles:
-        del article['position']
-    
-    # Create the final JSON structure
-    newspaper_data = {
-        'source_image': os.path.basename(image_path),
-        'total_articles': len(articles),
-        'detected_columns': num_columns,
-        'articles': articles
-    }
-    
-    return newspaper_data
+    return articles_json
+
 
 def process_directory(model, input_dir, output_dir, conf_threshold=0.05, ocr_languages=['en'], save_visualization=False, num_columns=None, auto_columns=False):
     """Process all images in a directory and output JSON files for each"""
@@ -783,16 +754,16 @@ def process_directory(model, input_dir, output_dir, conf_threshold=0.05, ocr_lan
 
 def main():
     args = parse_args()
-    
+   
     # Parse and initialize OCR languages
     ocr_languages = args.languages.split(',')
     print(f"Using OCR languages: {ocr_languages}")
-    
+   
     # Check that either image or input_dir is specified
     if not args.image and not args.input_dir:
         print("Error: Either --image or --input_dir must be specified")
         return
-    
+   
     # Load model
     try:
         print(f"Loading model from {args.model}...")
@@ -800,11 +771,11 @@ def main():
     except Exception as e:
         print(f"Error loading model: {e}")
         return
-    
+   
     # Determine column detection method
     use_auto_columns = args.auto_columns
     specified_num_columns = args.num_columns
-    
+   
     if args.image:
         # Process a single image
         print(f"Processing image: {args.image}")
@@ -813,33 +784,85 @@ def main():
             args.save_visualization,
             None if use_auto_columns else specified_num_columns  # Use None for auto-detection
         )
-        
+       
         if newspaper_data:
             # Create output directory if needed
             if not os.path.exists(args.output_dir):
                 os.makedirs(args.output_dir)
-            
+           
             # Save JSON output
             base_filename = os.path.splitext(os.path.basename(args.image))[0]
             json_output_path = os.path.join(args.output_dir, f"{base_filename}.json")
-            
+           
             with open(json_output_path, 'w', encoding='utf-8') as f:
                 json.dump(newspaper_data, f, indent=2, ensure_ascii=False)
-            
+           
             print(f"Saved article structure to {json_output_path}")
+            
+            # Now call the cleaning process on the extracted data
+            print(f"Cleaning extracted text with LLM...")
+            json_str = json.dumps(newspaper_data)
+            cleaned_article = json_str
+            
+            # Save cleaned article to markdown file
+            cleaned_output_path = os.path.join(args.output_dir, f"{base_filename}_cleaned.json")
+            with open(cleaned_output_path, 'w', encoding='utf-8') as f:
+                f.write(cleaned_article)
+                
+            print(f"Saved cleaned article to {cleaned_output_path}")
         else:
             print(f"Failed to process image: {args.image}")
-    
+   
     elif args.input_dir:
         # Process a directory of images
         print(f"Processing images in directory: {args.input_dir}")
-        process_directory(
-            model, args.input_dir, args.output_dir, args.conf,
-            ocr_languages, args.save_visualization,
-            specified_num_columns, use_auto_columns
-        )
-    
-    print("Text extraction complete!")
+        
+        # Get a list of image files to process
+        image_files = []
+        for ext in ['jpg', 'jpeg', 'png', 'tif', 'tiff']:
+            image_files.extend(glob.glob(os.path.join(args.input_dir, f"*.{ext}")))
+            image_files.extend(glob.glob(os.path.join(args.input_dir, f"*.{ext.upper()}")))
+        
+        for image_path in image_files:
+            print(f"Processing image: {image_path}")
+            newspaper_data = process_single_image(
+                model, image_path, args.conf, ocr_languages,
+                args.save_visualization,
+                None if use_auto_columns else specified_num_columns
+            )
+            
+            if newspaper_data:
+                # Create output directory if needed
+                if not os.path.exists(args.output_dir):
+                    os.makedirs(args.output_dir)
+                
+                # Save JSON output
+                base_filename = os.path.splitext(os.path.basename(image_path))[0]
+                json_output_path = os.path.join(args.output_dir, f"{base_filename}.json")
+                
+                with open(json_output_path, 'w', encoding='utf-8') as f:
+                    json.dump(newspaper_data, f, indent=2, ensure_ascii=False)
+                
+                print(f"Saved article structure to {json_output_path}")
+                
+                # Now call the cleaning process on the extracted data
+                print(f"Cleaning extracted text with LLM...")
+                json_str = json.dumps(newspaper_data)
+                cleaned_article = json_str
+                
+                # Save cleaned article to json file
+
+                cleaned_output_path = os.path.join(args.output_dir, f"{base_filename}_cleaned.json")
+                with open(cleaned_output_path, 'w', encoding='utf-8') as f:
+                    f.write(cleaned_article)
+                    
+                print(f"Saved cleaned article to {cleaned_output_path}")
+                    
+                
+            else:
+                print(f"Failed to process image: {image_path}")
+   
+    print("Text extraction and cleaning complete!")
 
 if __name__ == "__main__":
     main()
